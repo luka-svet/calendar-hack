@@ -1,6 +1,11 @@
 import { eachDayOfInterval } from "date-fns";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { register, unregister } from "timezone-mock";
-import { toDate } from "./icalservice";
+import { toDate, toIcal } from "./icalservice";
+import { build } from "./planbuilder";
+import { WeekStartsOnValues } from "./datecalc";
+import { TrainingPlan } from "types/app";
 
 beforeAll(() => {
   register("Europe/London");
@@ -25,4 +30,155 @@ it("should handle date intervals in which timezone offset changes (e.g. daylight
     [2023, 3, 28],
   ];
   expect(actual).toEqual(expected);
+});
+
+function normalizePlan(raw: unknown): TrainingPlan {
+  const plan = raw as TrainingPlan;
+  plan.schedule.forEach((week) => {
+    week.workouts.forEach((workout) => {
+      workout.description = workout.description || workout.title || "";
+      workout.tags = workout.tags || [];
+      workout.distance = workout.distance || [];
+      workout.units = workout.units || plan.units;
+    });
+  });
+  return plan;
+}
+
+function unfoldIcs(ics: string): string {
+  return ics.replace(/\r?\n[ \t]/g, "");
+}
+
+function lineValue(block: string, key: string): string {
+  const match = block.match(new RegExp(`^${key}:(.*)$`, "m"));
+  return match ? match[1].trim() : "";
+}
+
+function toIcsDate([year, month, day]: [number, number, number]): string {
+  return `${year}${String(month).padStart(2, "0")}${String(day).padStart(2, "0")}`;
+}
+
+function normalizeSummary(value: string): string {
+  return value.trim().toLowerCase().replace(/[\/_-]/g, " ").replace(/\s+/g, " ");
+}
+
+function usesMixedRestSemantics(plan: TrainingPlan): boolean {
+  let hasPureRest = false;
+  let hasCrossTrainRest = false;
+
+  for (const week of plan.schedule) {
+    for (const workout of week.workouts) {
+      const normalized = normalizeSummary(workout.title || "");
+      if (normalized === "rest" || normalized === "rest day" || normalized === "off day") {
+        hasPureRest = true;
+      }
+      if (
+        normalized.includes("cross train") ||
+        normalized.includes("cross training") ||
+        normalized.includes("strength training")
+      ) {
+        hasCrossTrainRest = true;
+      }
+
+      if (hasPureRest && hasCrossTrainRest) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+it("should clean exported events for real plans without hardcoded workout strings", () => {
+  const planFiles = [
+    "hansons_adv_mara.json",
+    "higdon_int_mara1.json",
+    "pfitz_18_55.json",
+  ];
+
+  planFiles.forEach((planFile) => {
+    const fullPath = join(process.cwd(), "public", "plans", "json", planFile);
+    const raw = JSON.parse(readFileSync(fullPath, "utf8"));
+    const trainingPlan = normalizePlan(raw);
+    const planHasMixedRestSemantics = usesMixedRestSemantics(trainingPlan);
+    const racePlan = build(
+      trainingPlan,
+      new Date(2026, 9, 25),
+      WeekStartsOnValues.Monday,
+    );
+
+    const ics = toIcal(racePlan, trainingPlan.units);
+    expect(ics).toBeDefined();
+
+    const text = unfoldIcs(ics as string);
+    const events = text.match(/BEGIN:VEVENT[\s\S]*?END:VEVENT/g) || [];
+    expect(events.length).toBeGreaterThan(0);
+    expect(text).toContain("SUMMARY:Training Plan Weekly Total");
+    expect(text).toContain("DESCRIPTION:Week 1:");
+    expect(text).not.toContain("Weekly distance:");
+
+    const totalsBlocks = events.filter((eventBlock) =>
+      eventBlock.includes("SUMMARY:Training Plan Weekly Total"),
+    );
+    expect(totalsBlocks.length).toBeGreaterThan(0);
+
+    const weeksWithDistance = racePlan.dateGrid.weeks.filter((week) => {
+      const distance = week.days.reduce((acc, day) => {
+        const d = day.event?.dist;
+        if (typeof d === "number") {
+          return acc + d;
+        }
+        if (Array.isArray(d) && d.length > 0) {
+          return acc + d[0];
+        }
+        return acc;
+      }, 0);
+      return distance > 0;
+    });
+    expect(totalsBlocks.length).toBe(weeksWithDistance.length);
+
+    const expectedStart = toIcsDate(toDate(racePlan.dateGrid.weeks[0].days[0].date));
+    expect(totalsBlocks[0] as string).toContain(
+      `DTSTART;VALUE=DATE:${expectedStart}`,
+    );
+    expect(totalsBlocks[0] as string).toContain("TRANSP:TRANSPARENT");
+    expect(totalsBlocks[0] as string).toContain(
+      "X-MICROSOFT-CDO-BUSYSTATUS:FREE",
+    );
+    expect(totalsBlocks[0] as string).toMatch(/DESCRIPTION:Week 1:/);
+
+    // Rule checks on generated output, independent of specific workout values.
+    events.forEach((eventBlock) => {
+      const summary = lineValue(eventBlock, "SUMMARY");
+      const description = lineValue(eventBlock, "DESCRIPTION");
+      const normalizedSummary = summary.toLowerCase().trim();
+      const normalizedDescription = description.toLowerCase().trim();
+
+      if (summary === "Training Plan Weekly Total") {
+        return;
+      }
+
+      const isPureRest =
+        normalizedSummary === "rest" ||
+        normalizedSummary === "rest day" ||
+        normalizedSummary === "off day";
+      const isCrossTrainRest =
+        normalizedSummary.includes("cross train") ||
+        normalizedSummary.includes("cross training") ||
+        normalizedSummary.includes("strength training");
+
+      expect(isCrossTrainRest).toBe(false);
+      if (!planHasMixedRestSemantics) {
+        expect(isPureRest).toBe(false);
+      }
+      expect(normalizedSummary.includes("training week")).toBe(false);
+      expect(normalizedSummary.includes("distance")).toBe(false);
+      expect(normalizedSummary.includes(" with ")).toBe(false);
+      expect(normalizedSummary.includes("consisting of")).toBe(false);
+
+      if (description) {
+        expect(normalizedDescription).not.toBe(normalizedSummary);
+      }
+    });
+  });
 });
